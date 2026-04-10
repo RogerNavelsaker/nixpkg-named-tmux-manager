@@ -1,0 +1,558 @@
+package agent
+
+import (
+	"regexp"
+	"strconv"
+	"strings"
+)
+
+// Claude Code (cc) patterns for state detection.
+var (
+	// ccRateLimitPatterns indicates the agent hit an API usage limit.
+	// We use broad patterns here - false positives (waiting unnecessarily) are
+	// acceptable, but false negatives (interrupting a blocked agent) are costly.
+	ccRateLimitPatterns = []string{
+		"you've hit your limit",
+		"you.ve hit your limit",
+		"rate limit exceeded",
+		"rate limit",
+		"too many requests",
+		"please wait",
+		"try again later",
+		"usage limit",
+		"request limit",
+		"exceeded the limit",
+		"exceeded your limit",
+		"exceeded limit",
+	}
+
+	// ccContextWarnings indicates the agent is running low on context.
+	// Claude Code doesn't give explicit percentages, so we rely on warning messages.
+
+	ccContextWarnings = []string{
+		"this conversation is getting long",
+		"context limit",
+		"context is at its limit",
+		"running out of context",
+		"conversation is getting long",
+		"conversation is too long",
+		"approaching the limit",
+		"approaching its limit",
+		"nearing capacity",
+		"nearing its capacity",
+	}
+
+	// ccWorkingPatterns indicates the agent is actively producing output.
+	// CRITICAL: When these patterns match, DO NOT INTERRUPT the agent.
+	ccWorkingPatterns = []string{
+		"```",         // Code block delimiter (most reliable indicator)
+		"writing to ", // File write operation
+		"created ",    // File creation
+		"modified ",   // File modification
+		"deleted ",    // File deletion
+		"reading ",    // File read operation
+		"searching ",  // Search in progress
+		"running ",    // Command execution
+		"executing ",  // Command execution
+		"installing ", // Package installation
+		"compiling",   // Compilation
+		"building",    // Build process
+		"testing",     // Test execution
+		"fetching",    // Network operation
+		"downloading", // Download operation
+		"uploading",   // Upload operation
+	}
+
+	// ccIdlePatterns indicates the agent is waiting for user input.
+	// When these match at the end of output, it's safe to restart or send new work.
+	// NOTE: "bypass permissions on" was removed — it matches the permanent status bar,
+	// causing agents to always appear idle even while actively working.
+	ccIdlePatterns = []*regexp.Regexp{
+		regexp.MustCompile(`>\s*$`),      // Prompt waiting for input
+		regexp.MustCompile(`(?m)^>\s*$`), // Prompt line (empty prompt waiting for input)
+		regexp.MustCompile(`Human:\s*$`), // Conversation mode prompt
+		regexp.MustCompile(`waiting for input`),
+		regexp.MustCompile(`(?m)^.{0,40}\?\s*$`), // Short question prompt (max 40 chars to avoid matching reasoning output)
+		// Claude Code TUI patterns (welcome screen)
+		regexp.MustCompile(`(?i)claude\s+code\s+v[\d.]+`), // Version banner
+		regexp.MustCompile(`(?i)welcome\s+back`),          // Welcome message
+		regexp.MustCompile(`╰─>\s*$`),                     // Arrow prompt
+		regexp.MustCompile(`(?m)❯[\s\x{00a0}]*$`),         // Unicode heavy right-pointing angle prompt (multiline, NBSP-aware)
+	}
+
+	// ccSpinnerActivePatterns detect Claude Code's randomized spinner verbs
+	// (e.g. "Bunning… (3s)", "Scurrying… (12s)", "Running…", "· thinking", "· thought for 5s").
+	// When these match, the agent is actively working — NOT idle.
+	ccSpinnerActivePatterns = []*regexp.Regexp{
+		regexp.MustCompile(`\S+…\s+\(`),         // Timing spinners: "Bunning… (3s)"
+		regexp.MustCompile(`·\s*thinking`),      // Extended thinking indicator
+		regexp.MustCompile(`·\s*thought\s+for`), // Past thinking indicator (still active context)
+		regexp.MustCompile(`Running…`),          // Explicit running spinner
+	}
+
+	// ccErrorPatterns indicates an error condition.
+	ccErrorPatterns = []string{
+		"error:",
+		"failed:",
+		"exception:",
+		"panic:",
+		"fatal:",
+		"abort:",
+		"permission denied",
+		"access denied",
+		"connection refused",
+		"timeout",
+	}
+
+	// ccHeaderPattern confirms output is from Claude Code.
+	ccHeaderPattern = regexp.MustCompile(`(?i)\b(opus|claude|sonnet|haiku)\b\s*\d*\.?\d*`)
+)
+
+// Codex CLI (cod) patterns for state detection.
+var (
+	// codContextPattern extracts the explicit context percentage.
+	// This is the most valuable metric - Codex shows "47% context left".
+	// Example: "47% context left · ? for shortcuts"
+	codContextPattern = regexp.MustCompile(`(\d+)%\s*context\s*left`)
+
+	// codTokenPattern extracts token usage from response.
+	// Example: "Token usage: total=219,582 input=206,150 ..."
+	codTokenPattern = regexp.MustCompile(`Token usage:\s*total=(\d[\d,]*)`)
+
+	// codRateLimitPatterns indicates the agent hit usage limits.
+	codRateLimitPatterns = []string{
+		"you've reached your usage limit",
+		"you.ve reached your usage limit",
+		"rate limit exceeded",
+		"rate limit",
+		"quota exceeded",
+		"capacity reached",
+		"maximum requests",
+		"too many requests",
+	}
+
+	// codWorkingPatterns indicates active output production.
+	codWorkingPatterns = []string{
+		"```",       // Code block
+		"editing ",  // File edit
+		"creating ", // File creation
+		"writing ",  // File write
+		"reading ",  // File read
+		"running ",  // Command execution
+		"$ ",        // Shell command output indicator
+		"applying ", // Applying changes
+		"patching ", // Patch application
+		"deleting ", // File deletion
+	}
+
+	// codIdlePatterns indicates waiting for input.
+	codIdlePatterns = []*regexp.Regexp{
+		regexp.MustCompile(`>\s*$`),                // Standard prompt
+		regexp.MustCompile(`\?\s*for\s*shortcuts`), // Codex prompt line
+		regexp.MustCompile(`codex>\s*$`),           // Codex prompt
+		regexp.MustCompile(`(?m)^\s*›(?:\s.*)?$`),  // Codex chevron prompt, empty or with prefilled input
+	}
+
+	// codErrorPatterns indicates error conditions.
+	codErrorPatterns = []string{
+		"error:",
+		"failed:",
+		"exception:",
+		"could not",
+		"unable to",
+	}
+
+	// codHeaderPattern confirms output is from Codex CLI.
+	codHeaderPattern = regexp.MustCompile(`(?i)\b(codex|openai|gpt-\d)\b`)
+)
+
+// Gemini CLI (gmi) patterns for state detection.
+var (
+	// gmiMemoryPattern extracts memory usage.
+	// Less precise than Codex percentage but still useful.
+	// Example: "gemini-3-pro-preview /model | 396.8 MB"
+	gmiMemoryPattern = regexp.MustCompile(`/model\s*\|\s*(\d+\.?\d*)\s*MB`)
+
+	// gmiYoloPattern detects YOLO mode status.
+	// YOLO mode affects execution behavior (auto-approve commands).
+	gmiYoloPattern = regexp.MustCompile(`(?i)YOLO\s*mode:\s*(ON|OFF)`)
+
+	// gmiRateLimitPatterns indicates rate limiting.
+	// Gemini is less explicit about limits, so we use broader heuristics.
+	gmiRateLimitPatterns = []string{
+		"quota exceeded",
+		"quota",
+		"limit reached",
+		"rate limit",
+		"try again",
+		"capacity",
+		"resource exhausted",
+	}
+
+	// gmiWorkingPatterns indicates active output.
+	gmiWorkingPatterns = []string{
+		"```",         // Code block
+		"creating ",   // File creation
+		"writing ",    // File write
+		"executing ",  // Command execution
+		"running ",    // Running command
+		"generating ", // Content generation
+		"analyzing ",  // Analysis
+		"processing",  // General processing
+		"thinking",    // Chain of thought
+	}
+
+	// gmiIdlePatterns indicates waiting for input.
+	gmiIdlePatterns = []*regexp.Regexp{
+		regexp.MustCompile(`>\s*$`),       // Standard prompt
+		regexp.MustCompile(`gemini>\s*$`), // Gemini prompt
+	}
+
+	// gmiErrorPatterns indicates error conditions.
+	gmiErrorPatterns = []string{
+		"error",
+		"failed",
+		"exception",
+		"invalid",
+	}
+
+	// gmiShellModePattern detects shell mode.
+	// GOTCHA: Shell mode is triggered by "!" prefix in prompts.
+	gmiShellModePattern = regexp.MustCompile(`^!\s*`)
+
+	// gmiHeaderPattern confirms output is from Gemini CLI.
+	gmiHeaderPattern = regexp.MustCompile(`(?i)(gemini.*preview|gemini-\d|google\s+ai)`)
+)
+
+// Cursor (cursor) patterns.
+var (
+	cursorRateLimitPatterns = []string{
+		"rate limit",
+		"too many requests",
+		"quota exceeded",
+	}
+
+	cursorWorkingPatterns = []string{
+		"```",
+		"writing ",
+		"reading ",
+		"searching ",
+		"analyzing ",
+		"generating ",
+	}
+
+	cursorIdlePatterns = []*regexp.Regexp{
+		regexp.MustCompile(`>\s*$`),
+		regexp.MustCompile(`cursor>\s*$`),
+	}
+
+	cursorErrorPatterns = []string{
+		"error:",
+		"failed:",
+		"exception:",
+	}
+
+	cursorHeaderPattern = regexp.MustCompile(`(?i)(cursor|cursor\s+ai)`)
+)
+
+// Windsurf (windsurf) patterns.
+var (
+	windsurfRateLimitPatterns = []string{
+		"rate limit",
+		"too many requests",
+		"quota exceeded",
+	}
+
+	windsurfWorkingPatterns = []string{
+		"```",
+		"writing ",
+		"reading ",
+		"searching ",
+		"analyzing ",
+		"generating ",
+	}
+
+	windsurfIdlePatterns = []*regexp.Regexp{
+		regexp.MustCompile(`>\s*$`),
+		regexp.MustCompile(`windsurf>\s*$`),
+	}
+
+	windsurfErrorPatterns = []string{
+		"error:",
+		"failed:",
+		"exception:",
+	}
+
+	windsurfHeaderPattern = regexp.MustCompile(`(?i)(windsurf|windsurf\s+ide)`)
+)
+
+// Aider (aider) patterns.
+var (
+	aiderRateLimitPatterns = []string{
+		"rate limit",
+		"too many requests",
+		"quota exceeded",
+	}
+
+	aiderWorkingPatterns = []string{
+		"```",
+		"applied edit",
+		"committing",
+		"repo-map",
+		"analyzing",
+		"searching",
+	}
+
+	aiderIdlePatterns = []*regexp.Regexp{
+		regexp.MustCompile(`>\s*$`),
+		regexp.MustCompile(`aider>\s*$`),
+	}
+
+	aiderErrorPatterns = []string{
+		"error:",
+		"failed:",
+		"exception:",
+	}
+
+	aiderHeaderPattern = regexp.MustCompile(`(?i)(aider|aider\s+chat)`)
+)
+
+// Ollama (ollama) patterns.
+var (
+	ollamaRateLimitPatterns = []string{
+		"rate limit",
+		"too many requests",
+		"quota exceeded",
+	}
+
+	ollamaWorkingPatterns = []string{
+		"```",
+		"pulling manifest",
+		"verifying sha256 digest",
+		"writing manifest",
+		"removing any unused layers",
+		"generating ",
+		"thinking",
+	}
+
+	ollamaIdlePatterns = []*regexp.Regexp{
+		regexp.MustCompile(`>\s*$`),
+		regexp.MustCompile(`ollama>\s*$`),
+	}
+
+	ollamaErrorPatterns = []string{
+		"error:",
+		"failed:",
+		"exception:",
+	}
+
+	ollamaHeaderPattern = regexp.MustCompile(`(?im)(^ollama>\s*$|\bollama\s+(run|chat|serve|pull)\b|^\s*ollama\s+cli\b)`)
+)
+
+// matchAny returns true if text contains any of the patterns (case-insensitive).
+func matchAny(text string, patterns []string) bool {
+	if len(patterns) == 0 {
+		return false
+	}
+	textLower := strings.ToLower(text)
+	for _, p := range patterns {
+		// Optimization: patterns are already lowercase in ntm.
+		if strings.Contains(textLower, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchAnyRegex returns true if text matches any of the regex patterns.
+func matchAnyRegex(text string, patterns []*regexp.Regexp) bool {
+	for _, p := range patterns {
+		if p.MatchString(text) {
+			return true
+		}
+	}
+	return false
+}
+
+// collectMatches returns all patterns that matched in the text.
+func collectMatches(text string, patterns []string) []string {
+	var matches []string
+	if len(patterns) == 0 {
+		return matches
+	}
+	textLower := strings.ToLower(text)
+	for _, p := range patterns {
+		// Optimization: patterns are already lowercase in ntm.
+		if strings.Contains(textLower, p) {
+			matches = append(matches, p)
+		}
+	}
+	return matches
+}
+
+// extractFloat extracts the last float value from a regex match group.
+// Returns nil if no match or parse error.
+func extractFloat(pattern *regexp.Regexp, text string) *float64 {
+	matches := pattern.FindAllStringSubmatch(text, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	match := matches[len(matches)-1]
+	if len(match) < 2 {
+		return nil
+	}
+	// Handle comma-separated numbers (e.g., "219,582")
+	cleaned := strings.ReplaceAll(match[1], ",", "")
+	val, err := strconv.ParseFloat(cleaned, 64)
+	if err == nil {
+		return &val
+	}
+	return nil
+}
+
+// extractInt extracts the last integer value from a regex match group.
+// Returns nil if no match or parse error.
+func extractInt(pattern *regexp.Regexp, text string) *int64 {
+	matches := pattern.FindAllStringSubmatch(text, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	match := matches[len(matches)-1]
+	if len(match) < 2 {
+		return nil
+	}
+	// Handle comma-separated numbers
+	cleaned := strings.ReplaceAll(match[1], ",", "")
+	val, err := strconv.ParseInt(cleaned, 10, 64)
+	if err == nil {
+		return &val
+	}
+	return nil
+}
+
+// ansiPattern matches ANSI escape sequences.
+// Matches CSI sequences (with private mode ?) and OSC sequences (title setting etc)
+var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\a\x1b]*(\a|\x1b\\)`)
+
+// stripANSICodes removes ANSI escape sequences and other problematic control characters.
+// This ensures pattern matching works correctly on terminal output.
+func stripANSICodes(text string) string {
+	// First, remove common ANSI escape sequences
+	clean := ansiPattern.ReplaceAllString(text, "")
+
+	// Second, handle carriage returns by keeping only the text after the last CR in each line.
+	// This simulates the terminal's behavior of overwriting lines.
+	if !strings.Contains(clean, "\r") {
+		return clean
+	}
+
+	var sb strings.Builder
+	sb.Grow(len(clean))
+
+	start := 0
+	for {
+		newlineIdx := strings.Index(clean[start:], "\n")
+		var line string
+		if newlineIdx == -1 {
+			line = clean[start:]
+		} else {
+			line = clean[start : start+newlineIdx]
+		}
+
+		if lastCR := strings.LastIndex(line, "\r"); lastCR != -1 {
+			sb.WriteString(line[lastCR+1:])
+		} else {
+			sb.WriteString(line)
+		}
+
+		if newlineIdx == -1 {
+			break
+		}
+		sb.WriteByte('\n')
+		start += newlineIdx + 1
+	}
+
+	return sb.String()
+}
+
+// PatternSet groups all patterns for a specific agent type.
+// This makes it easier to pass around and test pattern collections.
+type PatternSet struct {
+	RateLimitPatterns []string
+	WorkingPatterns   []string
+	IdlePatterns      []*regexp.Regexp
+	ErrorPatterns     []string
+	ContextWarnings   []string       // Only used by Claude Code
+	ContextPattern    *regexp.Regexp // Explicit context extraction (Codex)
+	TokenPattern      *regexp.Regexp // Token usage extraction
+	MemoryPattern     *regexp.Regexp // Memory usage (Gemini)
+	HeaderPattern     *regexp.Regexp
+}
+
+// GetPatternSet returns the pattern set for the given agent type.
+func GetPatternSet(agentType AgentType) *PatternSet {
+	switch agentType {
+	case AgentTypeClaudeCode:
+		return &PatternSet{
+			RateLimitPatterns: ccRateLimitPatterns,
+			WorkingPatterns:   ccWorkingPatterns,
+			IdlePatterns:      ccIdlePatterns,
+			ErrorPatterns:     ccErrorPatterns,
+			ContextWarnings:   ccContextWarnings,
+			HeaderPattern:     ccHeaderPattern,
+		}
+	case AgentTypeCodex:
+		return &PatternSet{
+			RateLimitPatterns: codRateLimitPatterns,
+			WorkingPatterns:   codWorkingPatterns,
+			IdlePatterns:      codIdlePatterns,
+			ErrorPatterns:     codErrorPatterns,
+			ContextPattern:    codContextPattern,
+			TokenPattern:      codTokenPattern,
+			HeaderPattern:     codHeaderPattern,
+		}
+	case AgentTypeGemini:
+		return &PatternSet{
+			RateLimitPatterns: gmiRateLimitPatterns,
+			WorkingPatterns:   gmiWorkingPatterns,
+			IdlePatterns:      gmiIdlePatterns,
+			ErrorPatterns:     gmiErrorPatterns,
+			MemoryPattern:     gmiMemoryPattern,
+			HeaderPattern:     gmiHeaderPattern,
+		}
+	case AgentTypeCursor:
+		return &PatternSet{
+			RateLimitPatterns: cursorRateLimitPatterns,
+			WorkingPatterns:   cursorWorkingPatterns,
+			IdlePatterns:      cursorIdlePatterns,
+			ErrorPatterns:     cursorErrorPatterns,
+			HeaderPattern:     cursorHeaderPattern,
+		}
+	case AgentTypeWindsurf:
+		return &PatternSet{
+			RateLimitPatterns: windsurfRateLimitPatterns,
+			WorkingPatterns:   windsurfWorkingPatterns,
+			IdlePatterns:      windsurfIdlePatterns,
+			ErrorPatterns:     windsurfErrorPatterns,
+			HeaderPattern:     windsurfHeaderPattern,
+		}
+	case AgentTypeAider:
+		return &PatternSet{
+			RateLimitPatterns: aiderRateLimitPatterns,
+			WorkingPatterns:   aiderWorkingPatterns,
+			IdlePatterns:      aiderIdlePatterns,
+			ErrorPatterns:     aiderErrorPatterns,
+			HeaderPattern:     aiderHeaderPattern,
+		}
+	case AgentTypeOllama:
+		return &PatternSet{
+			RateLimitPatterns: ollamaRateLimitPatterns,
+			WorkingPatterns:   ollamaWorkingPatterns,
+			IdlePatterns:      ollamaIdlePatterns,
+			ErrorPatterns:     ollamaErrorPatterns,
+			HeaderPattern:     ollamaHeaderPattern,
+		}
+	default:
+		return &PatternSet{} // Empty pattern set for unknown types
+	}
+}

@@ -1,0 +1,27 @@
+{
+  "source": {
+    "path": "upstream",
+    "channel": "github-release",
+    "defaultBranch": "main",
+    "tag": "v1.12.1",
+    "version": "1.12.1",
+    "rev": "eba56d0861585d627221fb7e248840f33ff3f358"
+  },
+  "package": {
+    "repo": "named-tmux-manager",
+    "version": "1.12.1"
+  },
+  "binary": {
+    "name": "ntm",
+    "package": "cmd/ntm"
+  },
+  "nix": {
+    "goBuilder": "go125",
+    "vendorHash": "sha256-srGlFXdP48TfD/84437kk1eUi9HWLKMwVEkzy1OMOMs="
+  },
+  "meta": {
+    "description": "Named Tmux Manager for orchestrating multi-agent tmux workflows",
+    "homepage": "https://github.com/Dicklesworthstone/ntm",
+    "licenseSpdx": "MIT"
+  }
+}

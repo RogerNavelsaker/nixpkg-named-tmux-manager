@@ -1,0 +1,835 @@
+// Package resilience provides auto-restart and recovery functionality for agents.
+package resilience
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/Dicklesworthstone/ntm/internal/agent"
+	"github.com/Dicklesworthstone/ntm/internal/config"
+	"github.com/Dicklesworthstone/ntm/internal/events"
+	"github.com/Dicklesworthstone/ntm/internal/health"
+	"github.com/Dicklesworthstone/ntm/internal/notify"
+	"github.com/Dicklesworthstone/ntm/internal/process"
+	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
+)
+
+// Overridable hooks for tests.
+// Protected by hooksMu for concurrent access from spawned goroutines.
+var (
+	hooksMu          sync.RWMutex
+	sendKeysFn       = tmux.SendKeys
+	buildPaneCmdFn   = tmux.BuildPaneCommand
+	sleepFn          = time.Sleep
+	checkSessionFn   = health.CheckSession
+	displayMessageFn = tmux.DisplayMessage
+	isChildAliveFn   = process.IsChildAlive
+)
+
+// AgentState tracks the state of an individual agent for restart purposes
+type AgentState struct {
+	PaneID              string
+	PaneIndex           int
+	ShellPID            int    // Shell PID from tmux #{pane_pid} — used for PID-based liveness checks
+	AgentType           string // cc, cod, gmi
+	Model               string // Model variant (opus, sonnet, etc.)
+	Command             string // Original launch command
+	RestartCount        int
+	LastCrash           time.Time
+	LastRestart         time.Time // When agent was last restarted
+	Healthy             bool
+	ConsecutiveFailures int       // Consecutive health check failures (for text-based debounce)
+	LastFailureReason   string    // Most recent failure reason (for logging)
+	RateLimited         bool      // Currently rate limited
+	LastRateLimitTime   time.Time // When rate limit was last detected
+	WaitSeconds         int       // Suggested wait time from rate limit message
+}
+
+// Monitor watches agent health and handles auto-restart
+type Monitor struct {
+	session          string
+	projectDir       string
+	cfg              *config.Config
+	notifier         *notify.Notifier
+	rateLimitTracker *ratelimit.RateLimitTracker
+	codexThrottle    *ratelimit.CodexThrottle // AIMD throttle for cod launches (bd-3qoly)
+
+	autoRestart bool // Whether to automatically restart crashed agents
+
+	mu     sync.RWMutex
+	agents map[string]*AgentState // keyed by pane ID
+	cancel context.CancelFunc
+	done   chan struct{}
+	wg     sync.WaitGroup // Waits for background tasks on shutdown
+}
+
+// NewMonitor creates a new resilience monitor for a session
+func NewMonitor(session, projectDir string, cfg *config.Config, autoRestart bool) *Monitor {
+	var notifier *notify.Notifier
+	if cfg.Notifications.Enabled {
+		notifier = notify.NewWithRedaction(cfg.Notifications, cfg.Redaction.ToRedactionLibConfig())
+	}
+
+	var tracker *ratelimit.RateLimitTracker
+	if cfg.Resilience.RateLimit.Detect {
+		tracker = ratelimit.NewRateLimitTracker(projectDir)
+		if err := tracker.LoadFromDir(projectDir); err != nil {
+			log.Printf("[resilience] Warning: failed to load rate limit history: %v", err)
+		}
+	}
+
+	return &Monitor{
+		session:          session,
+		projectDir:       projectDir,
+		cfg:              cfg,
+		notifier:         notifier,
+		rateLimitTracker: tracker,
+		autoRestart:      autoRestart,
+		agents:           make(map[string]*AgentState),
+	}
+}
+
+// SetCodexThrottle attaches a CodexThrottle to the monitor so that
+// rate-limit events on cod agents are propagated to the throttle.
+func (m *Monitor) SetCodexThrottle(ct *ratelimit.CodexThrottle) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.codexThrottle = ct
+}
+
+// RegisterAgent adds an agent to be monitored.
+// shellPID is the tmux pane's shell PID for PID-based liveness checking.
+func (m *Monitor) RegisterAgent(paneID string, paneIndex int, shellPID int, agentType, model, command string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.agents[paneID] = &AgentState{
+		PaneID:    paneID,
+		PaneIndex: paneIndex,
+		ShellPID:  shellPID,
+		AgentType: agentType,
+		Model:     model,
+		Command:   command,
+		Healthy:   true,
+	}
+}
+
+// ScanAndRegisterAgents discovers agents from existing tmux panes
+func (m *Monitor) ScanAndRegisterAgents() error {
+	panes, err := tmux.GetPanes(m.session)
+	if err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, p := range panes {
+		// Only monitor agent panes (not user or unknown)
+		if p.Type == tmux.AgentUser {
+			continue
+		}
+
+		// Skip if already registered
+		if _, exists := m.agents[p.ID]; exists {
+			continue
+		}
+
+		// Determine command template
+		var agentCmdTemplate string
+		switch p.Type {
+		case tmux.AgentClaude:
+			agentCmdTemplate = m.cfg.Agents.Claude
+		case tmux.AgentCodex:
+			agentCmdTemplate = m.cfg.Agents.Codex
+		case tmux.AgentGemini:
+			agentCmdTemplate = m.cfg.Agents.Gemini
+		case tmux.AgentOllama:
+			agentCmdTemplate = m.cfg.Agents.Ollama
+		case tmux.AgentCursor:
+			agentCmdTemplate = m.cfg.Agents.Cursor
+		case tmux.AgentWindsurf:
+			agentCmdTemplate = m.cfg.Agents.Windsurf
+		case tmux.AgentAider:
+			agentCmdTemplate = m.cfg.Agents.Aider
+		default:
+			// Check plugins
+			if cmd, ok := m.cfg.Agents.Plugins[string(p.Type)]; ok {
+				agentCmdTemplate = cmd
+			}
+		}
+
+		if agentCmdTemplate == "" {
+			log.Printf("[resilience] Warning: no command template found for agent type %s (pane %s)", p.Type, p.ID)
+			continue
+		}
+
+		// Resolve model
+		modelName := m.cfg.Models.GetModelName(string(p.Type), p.Variant)
+
+		// Generate command
+		// Use NTM index (logical agent number) if available, otherwise fallback to tmux pane index
+		paneIdx := p.Index
+		if p.NTMIndex > 0 {
+			paneIdx = p.NTMIndex
+		}
+
+		cmd, err := config.GenerateAgentCommand(agentCmdTemplate, config.AgentTemplateVars{
+			Model:          modelName,
+			ModelAlias:     p.Variant,
+			ModelRequested: strings.TrimSpace(p.Variant) != "",
+			SessionName:    m.session,
+			PaneIndex:      paneIdx,
+			AgentType:      string(p.Type),
+			ProjectDir:     m.projectDir,
+			// Note: SystemPromptFile is lost in reconstruction
+		})
+
+		if err != nil {
+			log.Printf("[resilience] Failed to reconstruct command for %s: %v", p.ID, err)
+			continue
+		}
+
+		m.agents[p.ID] = &AgentState{
+			PaneID:    p.ID,
+			PaneIndex: paneIdx,
+			ShellPID:  p.PID,
+			AgentType: string(p.Type),
+			Model:     p.Variant,
+			Command:   cmd,
+			Healthy:   true,
+		}
+	}
+	return nil
+}
+
+// Start begins monitoring agent health in the background
+func (m *Monitor) Start(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	childCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+
+	m.mu.Lock()
+	if m.cancel != nil {
+		m.mu.Unlock()
+		cancel()
+		return
+	}
+
+	m.cancel = cancel
+	m.done = done
+	m.mu.Unlock()
+
+	go m.monitorLoop(childCtx, done)
+}
+
+// Stop stops the monitor gracefully.
+// Safe to call even if Start() was never called.
+func (m *Monitor) Stop() {
+	m.mu.Lock()
+	cancel := m.cancel
+	done := m.done
+	m.mu.Unlock()
+
+	if cancel == nil {
+		return
+	}
+
+	cancel()
+	<-done
+	m.wg.Wait()
+
+	m.mu.Lock()
+	if m.done == done {
+		m.done = nil
+	}
+	m.cancel = nil
+	m.mu.Unlock()
+}
+
+// GetRestartCount returns the number of restarts for an agent
+func (m *Monitor) GetRestartCount(paneID string) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if agent, ok := m.agents[paneID]; ok {
+		return agent.RestartCount
+	}
+	return 0
+}
+
+// GetAgentStates returns a copy of all agent states
+func (m *Monitor) GetAgentStates() map[string]AgentState {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	states := make(map[string]AgentState, len(m.agents))
+	for id, agent := range m.agents {
+		states[id] = *agent
+	}
+	return states
+}
+
+// monitorLoop is the main health check loop
+func (m *Monitor) monitorLoop(ctx context.Context, done chan struct{}) {
+	defer close(done)
+
+	m.mu.RLock()
+	healthCheckSeconds := m.cfg.Resilience.HealthCheckSeconds
+	m.mu.RUnlock()
+
+	checkInterval := time.Duration(healthCheckSeconds) * time.Second
+	if checkInterval < time.Second {
+		checkInterval = 10 * time.Second // Minimum 10 seconds
+	}
+
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.checkHealth(ctx)
+		}
+	}
+}
+
+// checkHealth performs a health check on all monitored agents
+func (m *Monitor) checkHealth(ctx context.Context) {
+	// Snapshot hooks under lock for thread-safe access
+	hooksMu.RLock()
+	checkFn := checkSessionFn
+	isAliveFn := isChildAliveFn
+	hooksMu.RUnlock()
+
+	m.mu.RLock()
+	session := m.session
+	m.mu.RUnlock()
+
+	// Get health status for the session WITHOUT holding the monitor lock (slow IO)
+	sessionHealth, err := checkFn(ctx, session)
+	if err != nil {
+		log.Printf("[resilience] health check failed: %v", err)
+		return
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Build a map of pane health by pane ID
+	healthByPaneID := make(map[string]*health.AgentHealth)
+	for i := range sessionHealth.Agents {
+		agent := &sessionHealth.Agents[i]
+		healthByPaneID[agent.PaneID] = agent
+	}
+
+	// Check each monitored agent
+	for paneID, agentState := range m.agents {
+		agentHealth, exists := healthByPaneID[paneID]
+
+		// If pane doesn't exist anymore, agent crashed hard
+		if !exists {
+			if agentState.Healthy {
+				m.handleCrash(ctx, agentState, "Pane no longer exists")
+			}
+			continue
+		}
+
+		// Check for rate limit (separate from crash handling)
+		if m.cfg.Resilience.RateLimit.Detect && agentHealth.RateLimited {
+			// Only notify if this is a new rate limit event (not already rate limited)
+			if !agentState.RateLimited {
+				m.handleRateLimit(agentState, agentHealth.WaitSeconds)
+			}
+		} else if agentState.RateLimited {
+			// Rate limit cleared
+			m.recordRateLimitSuccess(agentState.AgentType)
+			agentState.RateLimited = false
+			agentState.WaitSeconds = 0
+			log.Printf("[resilience] Agent %s rate limit cleared", agentState.PaneID)
+			// Notify Codex throttle of success (bd-3qoly)
+			if agent.AgentType(agentState.AgentType).Canonical() == agent.AgentTypeCodex && m.codexThrottle != nil {
+				m.codexThrottle.RecordSuccess()
+			}
+		}
+
+		// Check for error status or process exit
+		if agentHealth.Status == health.StatusError ||
+			agentHealth.ProcessStatus == health.ProcessExited {
+
+			// Single PID liveness check — store result to avoid TOCTOU race.
+			// The same pidAlive/pidKnown values drive both the guard and debounce.
+			var pidAlive, pidKnown bool
+			if agentHealth.ShellPID > 0 {
+				pidAlive = isAliveFn(agentHealth.ShellPID)
+				pidKnown = true
+			}
+
+			// PID-alive guard: agent process is actually running,
+			// skip crash handling regardless of what text patterns say.
+			if pidKnown && pidAlive {
+				agentState.ConsecutiveFailures = 0
+				log.Printf("[resilience] Agent %s: health check says unhealthy but PID %d has living children — skipping crash handling (false positive avoided)",
+					agentState.PaneID, agentHealth.ShellPID)
+				continue
+			}
+
+			if agentState.Healthy {
+				// Ignore transient errors during startup grace period
+				if !agentState.LastRestart.IsZero() && time.Since(agentState.LastRestart) < 5*time.Second {
+					continue
+				}
+
+				// IsWorking guard: never interrupt agents that are actively
+				// producing output. This prevents false-positive crash
+				// detection when AI agents print strings like "exit status"
+				// or "connection closed" in their normal output.
+				if agentHealth.Activity == health.ActivityActive {
+					log.Printf("[resilience] Agent %s reports error/exit but activity is active — skipping crash handler (IsWorking guard)", agentState.PaneID)
+					continue
+				}
+
+				reason := "Agent unhealthy"
+				if len(agentHealth.Issues) > 0 {
+					reason = agentHealth.Issues[0].Message
+				}
+				agentState.LastFailureReason = reason
+
+				// Debounce: PID-dead is authoritative (instant restart),
+				// text-based fallback requires consecutive failures.
+				threshold := m.cfg.Resilience.CrashThreshold
+				if threshold <= 0 {
+					threshold = 3
+				}
+
+				if pidKnown && !pidAlive {
+					// PID authoritatively dead — skip debounce, restart immediately
+					agentState.ConsecutiveFailures = threshold
+				} else {
+					// PID unavailable — text-based fallback, increment debounce
+					agentState.ConsecutiveFailures++
+					log.Printf("[resilience] Agent %s: text-based failure %d/%d — %s",
+						agentState.PaneID, agentState.ConsecutiveFailures, threshold, reason)
+				}
+
+				if agentState.ConsecutiveFailures >= threshold {
+					m.handleCrash(ctx, agentState, reason)
+					agentState.ConsecutiveFailures = 0
+				}
+			}
+		} else {
+			// Agent is healthy again
+			agentState.ConsecutiveFailures = 0
+			agentState.Healthy = true
+		}
+	}
+}
+
+// handleRateLimit processes a detected rate limit event
+func (m *Monitor) handleRateLimit(agentState *AgentState, waitSeconds int) {
+	agentState.RateLimited = true
+	agentState.LastRateLimitTime = time.Now()
+	agentState.WaitSeconds = waitSeconds
+
+	log.Printf("[resilience] Agent %s (pane %d, type %s) hit rate limit (wait %ds)",
+		agentState.PaneID, agentState.PaneIndex, agentState.AgentType, waitSeconds)
+
+	// Propagate to Codex throttle for cod agents (bd-3qoly)
+	if agent.AgentType(agentState.AgentType).Canonical() == agent.AgentTypeCodex && m.codexThrottle != nil {
+		m.codexThrottle.RecordRateLimit(agentState.PaneID, waitSeconds)
+		status := m.codexThrottle.Status()
+		log.Printf("[resilience] Codex throttle engaged: phase=%s, allowed=%d/%d, cooldown=%s",
+			status.Phase, status.AllowedConcurrent, status.MaxConcurrent,
+			ratelimit.FormatDelay(status.CooldownRemaining))
+	}
+
+	events.DefaultEmitter().Emit(events.NewWebhookEvent(
+		events.WebhookAgentRateLimit,
+		m.session,
+		agentState.PaneID,
+		agentState.AgentType,
+		fmt.Sprintf("Agent %s hit rate limit (wait %ds)", agentState.AgentType, waitSeconds),
+		map[string]string{
+			"project_dir":  m.projectDir,
+			"pane_index":   fmt.Sprintf("%d", agentState.PaneIndex),
+			"wait_seconds": fmt.Sprintf("%d", waitSeconds),
+		},
+	))
+
+	m.recordRateLimitHit(agentState.AgentType, waitSeconds)
+
+	// Snapshot values for async operations
+	session := m.session
+	paneID := agentState.PaneID
+	paneIndex := agentState.PaneIndex
+	agentType := agentState.AgentType
+	notifyEnabled := m.cfg.Resilience.RateLimit.Notify
+	rotateConfig := m.cfg.Rotation
+
+	// Run notifications and rotation triggers asynchronously
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		// Send rate limit notification if enabled
+		if notifyEnabled && m.notifier != nil {
+			event := notify.NewRateLimitEvent(session, paneID, agentType, waitSeconds)
+			if err := m.notifier.Notify(event); err != nil {
+				log.Printf("[resilience] notification error: %v", err)
+			}
+		}
+
+		// Trigger rotation assistance if enabled
+		if rotateConfig.Enabled && rotateConfig.AutoTrigger {
+			m.triggerRotationAssistance(session, paneIndex, agentType, rotateConfig)
+		}
+	}()
+}
+
+func (m *Monitor) recordRateLimitHit(agentType string, waitSeconds int) {
+	tracker := m.ensureRateLimitTracker()
+	if tracker == nil {
+		return
+	}
+	provider := ratelimit.NormalizeProvider(agentType)
+	tracker.RecordRateLimitWithCooldown(provider, "send", waitSeconds)
+
+	// Persist asynchronously
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		if err := tracker.SaveToDir(m.projectDir); err != nil {
+			log.Printf("[resilience] Warning: failed to persist rate limit history: %v", err)
+		}
+	}()
+}
+
+func (m *Monitor) recordRateLimitSuccess(agentType string) {
+	tracker := m.ensureRateLimitTracker()
+	if tracker == nil {
+		return
+	}
+	provider := ratelimit.NormalizeProvider(agentType)
+	tracker.RecordSuccess(provider)
+
+	// Persist asynchronously
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		if err := tracker.SaveToDir(m.projectDir); err != nil {
+			log.Printf("[resilience] Warning: failed to persist rate limit history: %v", err)
+		}
+	}()
+}
+
+func (m *Monitor) ensureRateLimitTracker() *ratelimit.RateLimitTracker {
+	if m.rateLimitTracker != nil {
+		return m.rateLimitTracker
+	}
+	if !m.cfg.Resilience.RateLimit.Detect {
+		return nil
+	}
+	tracker := ratelimit.NewRateLimitTracker(m.projectDir)
+	if err := tracker.LoadFromDir(m.projectDir); err != nil {
+		log.Printf("[resilience] Warning: failed to load rate limit history: %v", err)
+	}
+	m.rateLimitTracker = tracker
+	return tracker
+}
+
+// triggerRotationAssistance sends a notification with rotation command or auto-initiates rotation
+func (m *Monitor) triggerRotationAssistance(session string, paneIndex int, agentType string, rotateConfig config.RotationConfig) {
+	rotateCmd := fmt.Sprintf("ntm rotate %s --pane=%d", session, paneIndex)
+
+	log.Printf("[resilience] Suggesting rotation: %s", rotateCmd)
+
+	events.DefaultEmitter().Emit(events.NewWebhookEvent(
+		events.WebhookRotationNeeded,
+		session,
+		fmt.Sprintf("%d", paneIndex),
+		agentType,
+		"Rotation recommended",
+		map[string]string{
+			"project_dir":   m.projectDir,
+			"rotate_cmd":    rotateCmd,
+			"pane_index":    fmt.Sprintf("%d", paneIndex),
+			"agent_type":    agentType,
+			"auto_trigger":  fmt.Sprintf("%t", rotateConfig.AutoTrigger),
+			"auto_initiate": fmt.Sprintf("%t", rotateConfig.AutoInitiate),
+		},
+	))
+
+	// Send rotation notification with command
+	if m.notifier != nil {
+		event := notify.NewRotationNeededEvent(session, paneIndex, agentType, rotateCmd)
+		if err := m.notifier.Notify(event); err != nil {
+			log.Printf("[resilience] notification error: %v", err)
+		}
+	}
+
+	// Also display tmux message if in a tmux session
+	if session != "" {
+		msg := fmt.Sprintf("⚠️ Rate limit! Run: %s", rotateCmd)
+		displayTmuxMessage(session, msg)
+	}
+
+	// Auto-initiate rotation if configured (aggressive mode)
+	if rotateConfig.AutoInitiate {
+		log.Printf("[resilience] Auto-rotation configured but currently requires user interaction. Use command: %s", rotateCmd)
+		// Note: Auto-initiate is disabled in this implementation because
+		// rotation requires user interaction (browser account switch).
+		// Instead, we just provide the notification with command.
+	}
+}
+
+// displayTmuxMessage shows a message in the tmux session
+func displayTmuxMessage(session, msg string) {
+	// Snapshot the function under lock for thread-safe access from spawned goroutines
+	hooksMu.RLock()
+	fn := displayMessageFn
+	hooksMu.RUnlock()
+
+	// tmux display-message shows a message in the status line for 10 seconds
+	if err := fn(session, msg, 10000); err != nil {
+		log.Printf("[resilience] tmux display-message failed: %v", err)
+	}
+}
+
+// handleCrash processes a detected agent crash
+func (m *Monitor) handleCrash(ctx context.Context, agent *AgentState, reason string) {
+	agent.Healthy = false
+	agent.LastCrash = time.Now()
+
+	log.Printf("[resilience] Agent %s (pane %d, type %s) crashed: %s",
+		agent.PaneID, agent.PaneIndex, agent.AgentType, reason)
+
+	events.DefaultEmitter().Emit(events.NewWebhookEvent(
+		events.WebhookAgentCrashed,
+		m.session,
+		agent.PaneID,
+		agent.AgentType,
+		fmt.Sprintf("Agent %s crashed: %s", agent.AgentType, reason),
+		map[string]string{
+			"project_dir": m.projectDir,
+			"pane_index":  fmt.Sprintf("%d", agent.PaneIndex),
+			"reason":      reason,
+		},
+	))
+
+	// Snapshot values for async operations
+	session := m.session
+	paneID := agent.PaneID
+	agentType := agent.AgentType
+	notifyCrash := m.cfg.Resilience.NotifyOnCrash
+	notifyMax := m.cfg.Resilience.NotifyOnMaxRestarts
+	maxRestarts := m.cfg.Resilience.MaxRestarts
+	currentRestarts := agent.RestartCount
+
+	// Run notifications asynchronously
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		// Send crash notification if enabled
+		if notifyCrash && m.notifier != nil {
+			event := notify.NewAgentCrashedEvent(session, paneID, agentType)
+			event.Message = fmt.Sprintf("Agent %s crashed: %s", agentType, reason)
+			if err := m.notifier.Notify(event); err != nil {
+				log.Printf("[resilience] notification error: %v", err)
+			}
+		}
+
+		// Send max restarts notification if limit reached
+		if currentRestarts >= maxRestarts && notifyMax && m.notifier != nil {
+			event := notify.Event{
+				Type:    notify.EventAgentError,
+				Session: session,
+				Pane:    paneID,
+				Agent:   agentType,
+				Message: fmt.Sprintf("Agent %s exceeded max restart attempts (%d)",
+					agentType, maxRestarts),
+			}
+			if err := m.notifier.Notify(event); err != nil {
+				log.Printf("[resilience] notification error: %v", err)
+			}
+		}
+	}()
+
+	if currentRestarts >= maxRestarts {
+		events.DefaultEmitter().Emit(events.NewWebhookEvent(
+			events.WebhookAgentError,
+			m.session,
+			agent.PaneID,
+			agent.AgentType,
+			fmt.Sprintf("Agent %s exceeded max restart attempts (%d)", agent.AgentType, maxRestarts),
+			map[string]string{
+				"project_dir":     m.projectDir,
+				"pane_index":      fmt.Sprintf("%d", agent.PaneIndex),
+				"restart_count":   fmt.Sprintf("%d", currentRestarts),
+				"max_restarts":    fmt.Sprintf("%d", maxRestarts),
+				"crash_reason":    reason,
+				"auto_restart":    fmt.Sprintf("%t", m.autoRestart),
+				"notify_on_crash": fmt.Sprintf("%t", notifyCrash),
+			},
+		))
+	}
+
+	// Offer manual respawn if auto-restart is disabled or max restarts reached
+	if !m.autoRestart || agent.RestartCount >= m.cfg.Resilience.MaxRestarts {
+		m.suggestManualRespawn(agent)
+	}
+
+	// Attempt restart if enabled and under the limit
+	if m.autoRestart && agent.RestartCount < m.cfg.Resilience.MaxRestarts {
+		// Schedule restart
+		m.wg.Add(1)
+		go func() {
+			defer m.wg.Done()
+			m.restartAgent(ctx, agent)
+		}()
+	} else {
+		if !m.autoRestart {
+			log.Printf("[resilience] Auto-restart disabled. Agent %s stopped.", agent.PaneID)
+		} else {
+			log.Printf("[resilience] Agent %s exceeded max restarts (%d), not restarting",
+				agent.PaneID, m.cfg.Resilience.MaxRestarts)
+		}
+	}
+}
+
+func (m *Monitor) suggestManualRespawn(agent *AgentState) {
+	if m.session == "" {
+		return
+	}
+	respawnCmd := fmt.Sprintf("ntm respawn %s --panes=%d", m.session, agent.PaneIndex)
+	log.Printf("[resilience] Suggest manual respawn for %s: %s", agent.PaneID, respawnCmd)
+	displayTmuxMessage(m.session, fmt.Sprintf("⚠️ Agent crashed (pane %d). Run: %s", agent.PaneIndex, respawnCmd))
+}
+
+// restartAgent restarts a crashed agent after the configured delay
+func (m *Monitor) restartAgent(ctx context.Context, agent *AgentState) {
+	delay := time.Duration(m.cfg.Resilience.RestartDelaySeconds) * time.Second
+	log.Printf("[resilience] Restarting agent %s in %v...", agent.PaneID, delay)
+
+	// Snapshot hooks under lock for thread-safe access from spawned goroutines
+	hooksMu.RLock()
+	buildFunc := buildPaneCmdFn
+	sendFunc := sendKeysFn
+	isChildAliveFunc := isChildAliveFn
+	hooksMu.RUnlock()
+
+	select {
+	case <-time.After(delay):
+		// Continue
+	case <-ctx.Done():
+		log.Printf("[resilience] Restart cancelled for agent %s", agent.PaneID)
+		return
+	}
+
+	m.mu.Lock()
+	// Check if still in crashed state (could have been stopped or manually fixed)
+	currentAgent, ok := m.agents[agent.PaneID]
+	if !ok || currentAgent.Healthy {
+		m.mu.Unlock()
+		return
+	}
+	// Copy fields while holding lock to avoid race
+	agentCommand := currentAgent.Command
+	shellPID := currentAgent.ShellPID
+	m.mu.Unlock()
+
+	// Re-run the agent command in the pane
+	paneCmd, err := buildFunc(m.projectDir, agentCommand)
+	if err != nil {
+		log.Printf("[resilience] Refusing to restart agent %s: %v", agent.PaneID, err)
+		return
+	}
+
+	// Final PID guard: last-second check before injecting keys.
+	// The restart delay may have allowed the agent to recover.
+	// This prevents the most damaging outcome: injecting the spawn
+	// command as literal keystrokes into a running agent.
+	if shellPID > 0 && isChildAliveFunc(shellPID) {
+		log.Printf("[resilience] Agent %s: final PID guard — process recovered during restart delay, aborting restart", agent.PaneID)
+		m.mu.Lock()
+		if a, ok := m.agents[agent.PaneID]; ok {
+			a.Healthy = true
+		}
+		m.mu.Unlock()
+		return
+	}
+
+	m.mu.Lock()
+	var attemptRestartCount int
+	if a, ok := m.agents[agent.PaneID]; ok {
+		a.RestartCount++
+		attemptRestartCount = a.RestartCount
+	}
+	m.mu.Unlock()
+
+	if err := sendFunc(agent.PaneID, paneCmd, true); err != nil {
+		log.Printf("[resilience] Failed to restart agent %s (attempt %d/%d): %v",
+			agent.PaneID, attemptRestartCount, m.cfg.Resilience.MaxRestarts, err)
+		return
+	}
+
+	m.mu.Lock()
+	var finalRestartCount int
+	if a, ok := m.agents[agent.PaneID]; ok {
+		a.Healthy = true
+		a.LastRestart = time.Now()
+		finalRestartCount = a.RestartCount
+		log.Printf("[resilience] Agent %s restarted (attempt %d/%d)",
+			agent.PaneID, a.RestartCount, m.cfg.Resilience.MaxRestarts)
+	}
+	m.mu.Unlock()
+
+	events.DefaultEmitter().Emit(events.NewWebhookEvent(
+		events.WebhookAgentRestarted,
+		m.session,
+		agent.PaneID,
+		agent.AgentType,
+		"Agent restarted successfully",
+		map[string]string{
+			"project_dir":   m.projectDir,
+			"pane_index":    fmt.Sprintf("%d", agent.PaneIndex),
+			"auto_restart":  fmt.Sprintf("%t", m.autoRestart),
+			"restart_count": fmt.Sprintf("%d", finalRestartCount),
+		},
+	))
+
+	// Send restart notification
+	if m.notifier != nil {
+		event := notify.Event{
+			Type:    notify.EventAgentRestarted,
+			Session: m.session,
+			Pane:    agent.PaneID,
+			Agent:   agent.AgentType,
+			Message: fmt.Sprintf("Agent %s restarted (attempt %d/%d)",
+				agent.AgentType, finalRestartCount, m.cfg.Resilience.MaxRestarts),
+			Details: map[string]string{
+				"restart_count": fmt.Sprintf("%d", finalRestartCount),
+				"max_restarts":  fmt.Sprintf("%d", m.cfg.Resilience.MaxRestarts),
+			},
+		}
+		if err := m.notifier.Notify(event); err != nil {
+			log.Printf("[resilience] notification error: %v", err)
+		}
+	}
+
+	// Mark as healthy again (will be rechecked on next health cycle)
+	m.mu.Lock()
+	if a, ok := m.agents[agent.PaneID]; ok {
+		a.Healthy = true
+		a.LastRestart = time.Now()
+	}
+	m.mu.Unlock()
+}

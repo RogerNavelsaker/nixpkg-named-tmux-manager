@@ -1,0 +1,147 @@
+version: "2"
+run:
+  modules-download-mode: readonly
+  issues-exit-code: 1
+  tests: true
+output:
+  formats:
+    text:
+      path: stdout
+      print-linter-name: true
+      print-issued-lines: true
+linters:
+  enable:
+    - bodyclose
+    - dogsled
+    - durationcheck
+    - gosec
+    - nakedret
+    - nolintlint
+    - rowserrcheck
+    - sqlclosecheck
+  disable:
+    - dupl
+    - exhaustive
+    - funlen
+    - gochecknoglobals
+    - gocognit
+    - goconst
+    - gocritic
+    - gocyclo
+    - godot
+    - goprintffuncname
+    - ineffassign
+    - lll
+    - misspell
+    - noctx
+    - prealloc
+    - predeclared
+    - revive
+    - thelper
+    - tparallel
+    - unconvert
+    - unparam
+    - unused
+    - wastedassign
+    - whitespace
+    - wsl
+  settings:
+    errcheck:
+      check-type-assertions: false
+      check-blank: false
+      exclude-functions:
+        - (io.Closer).Close
+        - (net/http.ResponseWriter).Write
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - fmt.Print
+        - fmt.Printf
+        - fmt.Println
+        - (os.File).Close
+        - (*os.File).Close
+    gosec:
+      excludes:
+        - G104
+        - G110
+        - G115
+        - G204
+        - G301
+        - G302
+        - G304
+        - G305
+        - G306
+        - G404
+    govet:
+      disable:
+        - shadow
+        - fieldalignment
+        - unusedwrite
+      enable-all: true
+    nakedret:
+      max-func-lines: 50
+  exclusions:
+    generated: lax
+    rules:
+      - linters:
+          - dogsled
+          - errcheck
+          - gosec
+          - rowserrcheck
+          - sqlclosecheck
+          - staticcheck
+        path: _test\.go
+      - linters:
+          - errcheck
+        path: internal/cli/
+      - linters:
+          - errcheck
+        path: internal/(checkpoint|agentmail|cass|bv|auth|tmux|config|robot|events|history|notify|output|quota|tui|status|scanner|prompt|state|supervisor|tools|util|agent|handoff)/
+      - linters:
+          - dogsled
+          - errcheck
+          - rowserrcheck
+          - sqlclosecheck
+        path: tests/
+      - linters:
+          - staticcheck
+        text: 'SA1019:'
+      - linters:
+          - staticcheck
+        text: 'SA9003:'
+      - linters:
+          - staticcheck
+        text: 'SA4017:'
+      - linters:
+          - staticcheck
+        text: 'SA5011:'
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  new: false
+severity:
+  default: warning
+  rules:
+    - linters:
+        - govet
+      severity: error
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    gofmt:
+      simplify: true
+    goimports:
+      local-prefixes:
+        - github.com/Dicklesworthstone/ntm
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
