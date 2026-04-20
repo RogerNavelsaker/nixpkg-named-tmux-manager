@@ -1,8 +1,13 @@
-{ buildGo124Module ? null, buildGo125Module ? null, buildGoModule, lib }:
+{ buildGo124Module ? null, buildGo125Module ? null, buildGoModule, fetchFromGitHub, lib }:
 
 let
   manifest = builtins.fromJSON (builtins.readFile ./package-manifest.json);
-  sourceRoot = ../upstream;
+  sourceRoot = fetchFromGitHub {
+    owner = manifest.source.owner;
+    repo = manifest.source.repo;
+    rev = manifest.source.rev;
+    hash = manifest.source.hash;
+  };
   licenseMap = {
     "MIT" = lib.licenses.mit;
     "Apache-2.0" = lib.licenses.asl20;

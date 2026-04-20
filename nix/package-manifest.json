@@ -1,11 +1,14 @@
 {
   "source": {
-    "path": "upstream",
+    "type": "github",
+    "owner": "Dicklesworthstone",
+    "repo": "ntm",
     "channel": "github-release",
     "defaultBranch": "main",
     "tag": "v1.12.1",
     "version": "1.12.1",
-    "rev": "eba56d0861585d627221fb7e248840f33ff3f358"
+    "rev": "eba56d0861585d627221fb7e248840f33ff3f358",
+    "hash": "sha256-UdzQGo9FeJK3P9VW38zny2S/y/sX776VXCD7kNyvapI="
   },
   "package": {
     "repo": "named-tmux-manager",
