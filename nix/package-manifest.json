@@ -7,8 +7,8 @@
     "defaultBranch": "main",
     "tag": "v1.21.0",
     "version": "1.21.0",
-    "rev": "4c3c60a552d61e735583d494908a6f1df748417f",
-    "hash": "sha256-fyhfEes2otgszU7yRqhVHYASMZlE9VhHMWizvw7aDso="
+    "rev": "1bd2d3dc8d5072853d64bccb9907c6d9329d0213",
+    "hash": "sha256-NTmmMyH6RPDUI5tPI07119o1WRVxdJOAgKeB60hIb4A="
   },
   "package": {
     "repo": "named-tmux-manager",
