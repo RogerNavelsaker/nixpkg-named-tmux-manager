@@ -20,7 +20,7 @@
   },
   "nix": {
     "goBuilder": "go126",
-    "vendorHash": "sha256-srGlFXdP48TfD/84437kk1eUi9HWLKMwVEkzy1OMOMs="
+    "vendorHash": "sha256-3GQUtfsMQYsmuvBBxZ3paDrj11q8Rg6WRmsWIkAtpAY="
   },
   "meta": {
     "description": "Named Tmux Manager for orchestrating multi-agent tmux workflows",
