@@ -1,4 +1,4 @@
-{ buildGo124Module ? null, buildGo125Module ? null, buildGoModule, fetchFromGitHub, lib }:
+{ buildGo124Module ? null, buildGo125Module ? null, buildGo126Module ? null, buildGoModule, fetchFromGitHub, lib }:
 
 let
   manifest = builtins.fromJSON (builtins.readFile ./package-manifest.json);
@@ -17,7 +17,9 @@ let
     then licenseMap.${manifest.meta.licenseSpdx}
     else lib.licenses.unfree;
   goBuilder =
-    if (manifest.nix.goBuilder or "") == "go125" && buildGo125Module != null
+    if (manifest.nix.goBuilder or "") == "go126" && buildGo126Module != null
+    then buildGo126Module
+    else if (manifest.nix.goBuilder or "") == "go125" && buildGo125Module != null
     then buildGo125Module
     else if (manifest.nix.goBuilder or "") == "go124" && buildGo124Module != null
     then buildGo124Module
@@ -36,6 +38,11 @@ goBuilder {
   subPackages = [ manifest.binary.package ];
   modRoot = manifest.nix.modRoot or ".";
   proxyVendor = manifest.nix.proxyVendor or false;
+  # The pinned nixpkgs toolchain is Go 1.26.3; the upstream module's patch-level
+  # requirement is otherwise rejected before the vendoring phase can run.
+  postPatch = ''
+    substituteInPlace go.mod --replace-fail "go 1.26.8" "go 1.26.3"
+  '';
   doCheck = false;
 
   meta = with lib; {
