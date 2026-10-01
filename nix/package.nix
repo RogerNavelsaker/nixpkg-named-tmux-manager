@@ -38,6 +38,11 @@ goBuilder {
   subPackages = [ manifest.binary.package ];
   modRoot = manifest.nix.modRoot or ".";
   proxyVendor = manifest.nix.proxyVendor or false;
+  # The pinned nixpkgs toolchain is Go 1.26.3; the upstream module's patch-level
+  # requirement is otherwise rejected before the vendoring phase can run.
+  postPatch = ''
+    substituteInPlace go.mod --replace-fail "go 1.26.8" "go 1.26.3"
+  '';
   doCheck = false;
 
   meta = with lib; {
