@@ -19,7 +19,7 @@
     "package": "cmd/ntm"
   },
   "nix": {
-    "goBuilder": "go125",
+    "goBuilder": "go126",
     "vendorHash": "sha256-srGlFXdP48TfD/84437kk1eUi9HWLKMwVEkzy1OMOMs="
   },
   "meta": {
