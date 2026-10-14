@@ -5,14 +5,14 @@
     "repo": "ntm",
     "channel": "github-release",
     "defaultBranch": "main",
-    "tag": "v1.37.1",
-    "version": "1.37.1",
-    "rev": "33e010ebddd2b88c31915cae28ec66f1f5960988",
-    "hash": "sha256-dn+s0nAid9wlBKX6qxB8IY0uKEcZbET8jWo0/bI7NhY="
+    "tag": "v1.37.2",
+    "version": "1.37.2",
+    "rev": "768b6a70e2d2deacc32c95b4490cf21a3ddf318b",
+    "hash": "sha256-gVZWHijfGZhGLxjpoFGhBgVyTmkE35LdHLj/+KNx3JM="
   },
   "package": {
     "repo": "named-tmux-manager",
-    "version": "1.37.1"
+    "version": "1.37.2"
   },
   "binary": {
     "name": "ntm",
